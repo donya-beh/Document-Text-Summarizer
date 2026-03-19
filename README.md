@@ -1,6 +1,6 @@
-## Document-Text-Summarizer
+# Document-Text-Summarizer
 
-# Project Overview
+## Project Overview
 
 This project implements a serverless document summarization pipeline using AWS services and generative AI. The system automatically processes uploaded documents, generates concise summaries using Amazon Bedrock, and stores the results for retrieval through a web interface.
 
@@ -8,7 +8,7 @@ The pipeline is designed as an event-driven architecture, meaning the entire wor
 
 The system leverages several AWS services including Amazon S3, AWS Lambda, Amazon Bedrock, Amazon DynamoDB, and API Gateway to create a scalable and fully serverless architecture.
 
-# Use Case
+## Use Case
 
 As a consultant assisting attorneys representing children in lawsuits against youth-serving organizations, large volumes of historical documents must be analyzed to identify patterns of negligence and institutional failures. These documents can include:
 
