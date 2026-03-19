@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Document Summary Output</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 24px;
+      background: #f7f7f7;
+      color: #222;
+    }
+
+    h1 {
+      margin: 0 0 8px 0;
+      font-size: 28px;
+    }
+
+    .subtitle {
+      margin-bottom: 20px;
+      color: #666;
+      font-size: 15px;
+    }
+
+    button {
+      margin-bottom: 20px;
+      padding: 10px 16px;
+      border: none;
+      background: #1f6feb;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #1558b0;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      background: white;
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+      padding: 14px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1000px;
+    }
+
+    th, td {
+      border: 1px solid #ddd;
+      padding: 12px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      background: #f0f2f5;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+
+    tr:nth-child(even) {
+      background: #fafafa;
+    }
+
+    .mono {
+      font-family: monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .summary-cell {
+      max-width: 420px;
+      min-width: 220px;
+    }
+
+    .summary-preview {
+      white-space: normal;
+      word-break: break-word;
+      line-height: 1.45;
+    }
+
+    .summary-full {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.45;
+      display: none;
+      user-select: text;
+      cursor: text;
+      margin-top: 8px;
+    }
+
+    .summary-full.expanded {
+      display: block;
+    }
+
+    .summary-toggle {
+      margin-top: 8px;
+      padding: 0;
+      border: none;
+      background: none;
+      color: #1f6feb;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .summary-toggle:hover {
+      text-decoration: underline;
+      background: none;
+    }
+
+    .status-ok {
+      font-weight: bold;
+      color: #1a7f37;
+    }
+
+    .status-error {
+      font-weight: bold;
+      color: #b42318;
+    }
+
+    .status-empty {
+      font-weight: bold;
+      color: #b26a00;
+    }
+
+    .loading, .error {
+      margin-top: 20px;
+      font-size: 16px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Document Summary Output</h1>
+  <div class="subtitle">Generated summaries from the S3 → Lambda → Bedrock pipeline</div>
+
+  <button onclick="loadData()">Refresh</button>
+
+  <div id="status" class="loading">Loading data...</div>
+
+  <div class="table-wrap" id="table-container" style="display:none;">
+    <table id="data-table">
+      <thead>
+        <tr id="table-head"></tr>
+      </thead>
+      <tbody id="table-body"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const apiUrl = "https://1it2q05qbj.execute-api.us-east-1.amazonaws.com/summaries";
+
+    const columnLabels = {
+      created_at: "Creation Stamp",
+      status: "Status",
+      model_id: "Model",
+      source_key: "Source File",
+      summary: "Generated Summary",
+      error_message: "Error Message"
+    };
+
+    const preferredOrder = [
+      "created_at",
+      "status",
+      "model_id",
+      "source_key",
+      "summary",
+      "error_message"
+    ];
+
+    function escapeHtml(value) {
+      if (value === null || value === undefined) return "";
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function formatValue(key, value) {
+      if (value === null || value === undefined) return "";
+
+      if (typeof value === "object") {
+        value = JSON.stringify(value, null, 2);
+      }
+
+      if (key === "created_at") {
+        const date = new Date(value);
+        if (!isNaN(date.getTime())) {
+          return date.toLocaleString();
+        }
+      }
+
+      return String(value);
+    }
+
+    function getStatusClass(status) {
+      if (!status) return "";
+      const normalized = String(status).toUpperCase();
+      if (normalized === "OK") return "status-ok";
+      if (normalized === "ERROR") return "status-error";
+      if (normalized === "EMPTY") return "status-empty";
+      return "";
+    }
+
+    function truncateText(text, maxLength = 180) {
+      if (!text || text.length <= maxLength) return text;
+      return text.slice(0, maxLength).trim() + "...";
+    }
+
+    function renderSummaryCell(text, rowIndex) {
+      const safeFull = escapeHtml(text || "");
+      const safePreview = escapeHtml(truncateText(text || ""));
+      const contentId = `summary-full-${rowIndex}`;
+      const buttonId = `summary-btn-${rowIndex}`;
+
+      if (!text) {
+        return `<td class="summary-cell"></td>`;
+      }
+
+      if (text.length <= 180) {
+        return `<td class="summary-cell"><div class="summary-preview">${safeFull}</div></td>`;
+      }
+
+      return `
+        <td class="summary-cell">
+          <div class="summary-preview" id="${contentId}-preview">${safePreview}</div>
+          <div class="summary-full mono" id="${contentId}">${safeFull}</div>
+          <button class="summary-toggle" id="${buttonId}" onclick="toggleSummary('${contentId}', '${buttonId}')">
+            Show full summary
+          </button>
+        </td>
+      `;
+    }
+
+    function toggleSummary(contentId, buttonId) {
+      const full = document.getElementById(contentId);
+      const btn = document.getElementById(buttonId);
+
+      if (!full || !btn) return;
+
+      const expanded = full.classList.toggle("expanded");
+      btn.textContent = expanded ? "Hide full summary" : "Show full summary";
+    }
+
+    async function loadData() {
+      const status = document.getElementById("status");
+      const container = document.getElementById("table-container");
+      const head = document.getElementById("table-head");
+      const body = document.getElementById("table-body");
+
+      status.textContent = "Loading data...";
+      status.className = "loading";
+      container.style.display = "none";
+      head.innerHTML = "";
+      body.innerHTML = "";
+
+      try {
+        const response = await fetch(apiUrl);
+        const data = await response.json();
+
+        if (!Array.isArray(data) || data.length === 0) {
+          status.textContent = "No summaries found.";
+          return;
+        }
+
+        const allKeys = [...new Set(data.flatMap(item => Object.keys(item)))];
+        const orderedKeys = [
+          ...preferredOrder.filter(k => allKeys.includes(k)),
+          ...allKeys.filter(k => !preferredOrder.includes(k))
+        ].filter(k => columnLabels[k]);
+
+        head.innerHTML = orderedKeys
+          .map(key => `<th>${escapeHtml(columnLabels[key] || key)}</th>`)
+          .join("");
+
+        body.innerHTML = data.map((item, rowIndex) => {
+          const cells = orderedKeys.map(key => {
+            const formatted = formatValue(key, item[key]);
+
+            if (key === "status") {
+              return `<td class="${getStatusClass(formatted)}">${escapeHtml(formatted)}</td>`;
+            }
+
+            if (key === "summary") {
+              return renderSummaryCell(formatted, rowIndex);
+            }
+
+            if (key === "source_key" || key === "model_id" || key === "error_message") {
+              return `<td class="mono">${escapeHtml(formatted)}</td>`;
+            }
+
+            return `<td>${escapeHtml(formatted)}</td>`;
+          }).join("");
+
+          return `<tr>${cells}</tr>`;
+        }).join("");
+
+        status.textContent = `Loaded ${data.length} summary record(s).`;
+        container.style.display = "block";
+
+      } catch (err) {
+        status.textContent = "Error loading data from API.";
+        status.className = "error";
+      }
+    }
+
+    loadData();
+  </script>
+</body>
+</html>
