@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  S3 -> Lambda -> Bedrock -> S3 + DynamoDB summarization pipeline,
+  plus a simple website path: S3 static website -> API Gateway -> Lambda -> DynamoDB.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: "gsb-521-text-summarizer"
+    Description: "Globally-unique S3 bucket name"
+
+  ModelId:
+    Type: String
+    Default: "amazon.nova-micro-v1:0"
+    Description: "Bedrock modelId"
+
+  TableName:
+    Type: String
+    Default: "DocSummaries"
+    Description: "DynamoDB table name to store summaries"
+
+  OutputPrefix:
+    Type: String
+    Default: "doc-output/"
+    Description: "S3 prefix for summaries"
+
+  InputPrefix:
+    Type: String
+    Default: "doc-input/"
+    Description: "S3 prefix for uploads that trigger the pipeline"
+
+  MaxChars:
+    Type: Number
+    Default: 12000
+    MinValue: 1000
+    MaxValue: 50000
+    Description: "Max characters of input text to send to Bedrock (cost control)"
+
+  MaxTokens:
+    Type: Number
+    Default: 450
+    MinValue: 100
+    MaxValue: 1200
+    Description: "Max tokens for the summary response"
+
+  WebsiteBucketName:
+    Type: String
+    Default: "gsb-521-text-summarizer-site"
+    Description: "Globally-unique S3 bucket name for the static website"
+
+Resources:
+  DocSummariesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: doc_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: doc_id
+          KeyType: HASH
+
+  SummarizeDocRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "SummarizeDocRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SummarizeDocInlinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3ReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}/${InputPrefix}*"
+                  - !Sub "arn:aws:s3:::${BucketName}/${OutputPrefix}*"
+
+              - Sid: DynamoDBWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Converse
+                Resource: "*"
+
+  SummarizeDoc:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "SummarizeDoc-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SummarizeDocRole.Arn
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          MODEL_ID: !Ref ModelId
+          OUTPUT_PREFIX: !Ref OutputPrefix
+          INPUT_PREFIX: !Ref InputPrefix
+          MAX_CHARS: !Ref MaxChars
+          MAX_TOKENS: !Ref MaxTokens
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import uuid
+          import datetime
+          import boto3
+          from urllib.parse import unquote_plus
+
+          s3 = boto3.client("s3")
+          bedrock = boto3.client("bedrock-runtime")
+          dynamodb = boto3.resource("dynamodb")
+
+          TABLE_NAME = os.environ["TABLE_NAME"]
+          MODEL_ID = os.environ["MODEL_ID"]
+          OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "doc-output/")
+          INPUT_PREFIX = os.environ.get("INPUT_PREFIX", "doc-input/")
+          MAX_CHARS = int(os.environ.get("MAX_CHARS", "12000"))
+          MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "450"))
+
+          table = dynamodb.Table(TABLE_NAME)
+
+          def _utc_now():
+              return datetime.datetime.utcnow().isoformat() + "Z"
+
+          def _call_model(prompt: str) -> str:
+              resp = bedrock.converse(
+                  modelId=MODEL_ID,
+                  messages=[
+                      {
+                          "role": "user",
+                          "content": [{"text": prompt}]
+                      }
+                  ],
+                  inferenceConfig={
+                      "maxTokens": MAX_TOKENS,
+                      "temperature": 0.2,
+                      "topP": 0.9
+                  }
+              )
+              blocks = resp.get("output", {}).get("message", {}).get("content", [])
+              text_parts = [b["text"] for b in blocks if "text" in b]
+              return "\n".join(text_parts).strip()
+
+          def lambda_handler(event, context):
+              record = event["Records"][0]
+              bucket = record["s3"]["bucket"]["name"]
+              key = unquote_plus(record["s3"]["object"]["key"])
+
+              if not key.lower().startswith(INPUT_PREFIX.lower()) or not key.lower().endswith(".txt"):
+                  return {"statusCode": 200, "body": f"Skipped: {key}"}
+
+              doc_id = str(uuid.uuid4())
+              created_at = _utc_now()
+
+              try:
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  text = obj["Body"].read().decode("utf-8", errors="ignore").strip()
+
+                  if not text:
+                      table.put_item(Item={
+                          "doc_id": doc_id,
+                          "status": "EMPTY",
+                          "source_bucket": bucket,
+                          "source_key": key,
+                          "created_at": created_at,
+                          "model_id": MODEL_ID
+                      })
+                      return {"statusCode": 200, "body": "Empty file; nothing to summarize."}
+
+                  text = text[:MAX_CHARS]
+
+                  prompt = (
+                      "Summarize the following document in EXACTLY 5 bullet points. "
+                      "Be concise and focus on key takeaways. "
+                      "Do not include any text outside the 5 bullets.\n\n"
+                      f"DOCUMENT:\n{text}"
+                  )
+
+                  summary = _call_model(prompt)
+
+                  base_name = key.split("/")[-1].replace(".txt", "")
+                  out_key = f"{OUTPUT_PREFIX}{base_name}_summary.txt"
+
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=out_key,
+                      Body=summary.encode("utf-8"),
+                      ContentType="text/plain; charset=utf-8"
+                  )
+
+                  table.put_item(Item={
+                      "doc_id": doc_id,
+                      "status": "OK",
+                      "source_bucket": bucket,
+                      "source_key": key,
+                      "output_key": out_key,
+                      "created_at": created_at,
+                      "model_id": MODEL_ID,
+                      "summary": summary
+                  })
+
+                  return {"statusCode": 200, "body": f"OK: {out_key} doc_id={doc_id}"}
+
+              except Exception as e:
+                  err = str(e)
+                  try:
+                      table.put_item(Item={
+                          "doc_id": doc_id,
+                          "status": "ERROR",
+                          "source_bucket": bucket,
+                          "source_key": key,
+                          "created_at": created_at,
+                          "model_id": MODEL_ID,
+                          "error_message": err[:1000]
+                      })
+                  except Exception:
+                      pass
+                  raise
+
+  SummarizeDocInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SummarizeDoc
+      Action: "lambda:InvokeFunction"
+      Principal: "s3.amazonaws.com"
+      SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
+  DocBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - SummarizeDocInvokePermission
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref InputPrefix
+                  - Name: suffix
+                    Value: ".txt"
+            Function: !GetAtt SummarizeDoc.Arn
+
+  GetSummariesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "GetSummariesRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GetSummariesInlinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBRead
+                Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+
+  GetSummariesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "GetSummaries-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt GetSummariesRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+
+          def lambda_handler(event, context):
+              response = table.scan()
+              items = response.get("Items", [])
+              items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*"
+                  },
+                  "body": json.dumps(items, default=decimal_default)
+              }
+
+  SummariesApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "SummariesApi-${AWS::StackName}"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+        AllowHeaders:
+          - "*"
+
+  SummariesIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SummariesApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetSummariesFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  SummariesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SummariesApi
+      RouteKey: "GET /summaries"
+      Target: !Sub "integrations/${SummariesIntegration}"
+
+  SummariesStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref SummariesApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  GetSummariesInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetSummariesFunction
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SummariesApi}/*/*"
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref WebsiteBucketName
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadWebsite
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${WebsiteBucketName}/*"
+
+Outputs:
+  BucketNameOut:
+    Value: !Ref BucketName
+    Description: "Upload .txt to s3://<bucket>/doc-input/ to trigger summarization."
+
+  DynamoDBTableOut:
+    Value: !Ref TableName
+    Description: "DynamoDB table storing summaries"
+
+  LambdaFunctionNameOut:
+    Value: !Ref SummarizeDoc
+    Description: "Lambda function name"
+
+  ApiUrlOut:
+    Value: !Sub "https://${SummariesApi}.execute-api.${AWS::Region}.amazonaws.com/summaries"
+    Description: "HTTP API URL returning DynamoDB items as JSON"
+
+  WebsiteBucketOut:
+    Value: !Ref WebsiteBucketName
+    Description: "Bucket that hosts your static website"
+
+  WebsiteUrlOut:
+    Value: !Sub "http://${WebsiteBucketName}.s3-website-${AWS::Region}.amazonaws.com"
+    Description: "Static website URL. Upload index.html to this bucket."
